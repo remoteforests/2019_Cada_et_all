@@ -1,0 +1,627 @@
+---
+title: "Supplement. Quantifying natural disturbances using a large-scale dendrochronological reconstruction to guide forest management"
+author: "Cada V., Trotsiuk V., ...."
+date: "2/8/2019"
+output: 
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Libraries and settings
+
+```{r libraries, echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(dplyr) 
+library(tibble)
+library(tidyr)
+library(zoo)
+library(pracma)
+library(readr)
+```
+
+# Functions
+
+```{r functions, echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+priorGrowth <- function(x, windowLength = 10){
+  rollapply( x, 
+             width = windowLength,
+             FUN = mean,
+             fill = NA,
+             align = "right",
+             na.rm = T,
+             partial = TRUE)
+}
+
+followGrowth <- function(x, windowLength = 10){
+  rollapply( lead(x, 1), 
+             width = windowLength,
+             FUN = mean,
+             fill = NA,
+             align = "left",
+             na.rm = T,
+             partial = TRUE)
+}
+
+peakDetection <- function(x, threshold, mindist = 20, nups = 2){
+  #' @description identify the index of year when release event occur
+  #' @param x a vector of absolute increase change
+  #' @param threshold a minimum ai value in mm
+  #' @param mindist  minimum distance between two consecutive peaks in years
+  #' @param nups number of increasing steps before the peak
+  
+  x <- ifelse(is.na(x), -0.2, x)
+  
+  x <- findpeaks(x, 
+                 minpeakheight = threshold,
+                 minpeakdistance = mindist,
+                 nups = nups) 
+  
+  if(is.null(x)){
+    NA
+  }else{
+    matrix(x, ncol = 4)[,2]
+  }
+}
+
+keepRelease <- function(year, type, n = 20){
+  #' @description calculate the distance between gap origin and releases
+  #' @param year the vector of years for event
+  #' @param type type of the event (release or gap)
+  #' @param n number of years to be checked
+  
+  keep <- rep('yes', length(year))
+  
+  if(any(type %in% 'gap')){
+    diffyear <- year - year[type %in% 'gap']
+    keep[diffyear < n & type %in% 'release'] <- 'no'
+  }
+  keep
+}
+
+growthCalculate <- function(data = data, windowLength = 10){
+  #' @description take the list of data prepared by 'dist_get_data' function and calculate the growth change, plus age and dbh of the trees
+  #' @param data a list of tree tables
+  #' @param windowLength the length of the window for ai calculation
+  
+  # data quality check
+  options(error = NULL) # not to enter debug mode
+  
+  # perform the checks
+  if(!is.list(data)) stop('The input data is not a list of three tables')
+  if(!identical(c('core',"dist_param","ring"), ls(data))) stop('The input data tables dont match with required')
+  
+  # calculate the age, dbh, and the growth change
+  inner_join(
+    data$ring,
+    data$core,
+    by = 'core_id'
+  ) %>%
+    arrange(core_id, year) %>%
+    group_by(core_id) %>%
+    mutate(dbh_growth = ifelse(row_number() == 1, incr_mm + missing_mm, incr_mm),
+           dbh_growth = cumsum(dbh_growth) * 2,
+           dbh_mm = ifelse(is.na(dbh_mm), max(dbh_growth), dbh_mm),
+           dbh_coef = max(dbh_mm) / max(dbh_growth),
+           dbh_growth = dbh_growth * dbh_coef,
+           age = year - min(year) + missing_years + 1,
+           pg = priorGrowth(incr_mm, windowLength = windowLength),
+           fg = followGrowth(incr_mm, windowLength = windowLength),
+           ai = fg - pg) %>%
+    select(dist_param, tree_id, core_id, ring_id, year, incr_mm, age, dbh_mm = dbh_growth, ai, fg, pg) ->
+    data$ring
+  
+  return(data)
+}
+
+releaseCalculate <- function(data = NULL,  gapAge = c(5:15), nprol = 7){
+  #' @description function calculate the releases for individual trees
+  #' @param data a list of three dataframes, output of growthCalculate function
+  #' @param nprol number of years to consider that release is sustaind
+  #' @param gapAge age of the tree when it shall be tested for gap origin
+  
+  # data quality check
+  options(error = NULL) # not to enter debug mode
+  
+  # perform the checks
+  if(!is.list(data)) stop('The input data is not a list of three tables')
+  if(!identical(c('core',"dist_param","ring"), ls(data))) stop('The input data tables dont match with required')
+  
+  aith <- data$dist_param  %>% select(dist_param, ai_mm) %>% deframe()
+  gapth <- data$dist_param  %>% select(dist_param, gap_mm) %>% deframe()
+  
+  # calculate releases
+  data$ring %>%
+    arrange(year) %>%
+    group_by(core_id) %>%
+    mutate(event = ifelse(row_number() %in%  peakDetection(x = ai, threshold = aith[first(as.character(dist_param))], nups = 1,  mindist = 30), 'release', NA),
+           event = ifelse(lead(fg, nprol) <= pg, NA, event),
+           event = ifelse(lag(pg, nprol) >= fg, NA, event)) %>%
+    filter(!is.na(event)) %>%
+    select(core_id, year, event) ->
+    release.event
+  
+  # calculate the gap origin 
+  data$ring %>% 
+    filter(age %in% gapAge) %>%
+    arrange(year) %>%
+    group_by(core_id) %>%
+    summarise(dist_param = first(dist_param),
+              gapGrowth = mean(incr_mm, na.rm = T),
+              N = n(),
+              year = min(year)) %>%
+    filter(N >= 5,
+           gapGrowth >= gapth[as.character(dist_param)]) %>%
+    mutate(event = 'gap') %>%
+    select(core_id, year, event) ->
+    gap.event
+  
+  # add those that don't have any event
+  data$ring %>%
+    filter(!core_id %in% c(unique(gap.event$core_id), unique(release.event$core_id))) %>%
+    group_by(core_id) %>%
+    summarise(year = min(year)) %>%
+    mutate(event = 'no event') ->
+    no.event
+  
+  # add together the events
+  bind_rows(release.event, gap.event, no.event) %>%
+    arrange(year) %>%
+    group_by(core_id) %>%
+    mutate(keeprel = keepRelease(year, event, n = 30)) %>%
+    ungroup() %>%
+    filter(keeprel %in% 'yes') %>%
+    inner_join(., data$ring, by = c('core_id', 'year')) %>%
+    select(ring_id, dist_param, year, age, dbh_mm, ai, event) ->
+    data$event
+  
+  return(data)
+  
+}
+
+mdsFun <- function(ca, k = 30, bw = 5, st = 7){
+  #' @description return a vector of the fited KDE function
+  #' @param ca arranged vector of the canopy area values
+  #' @param k a windows length, default 30
+  #' @param bw a smoothing bandwidth to be used, default = 5
+  #' @param st a standartization value, to scale back to canopy area
+  
+  rollapply( ca, 
+             width = k,
+             FUN = function(x){n <- length(x); density(1:n, weights = x, bw = bw, n = n)$y[round((n+1)/2)]* 100/st},
+             fill = 0,
+             align = "center",
+             partial = TRUE)
+}
+```
+
+# Data
+
+```{r data, echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+plots_clean <- read_csv("plots_clean_app.csv")
+
+dist_patches <- read_csv("dist_patches_app.csv") %>% filter(stand_size > 20)
+
+data_list <- list(
+  dist_param = read_csv("dist_param_app.csv"),
+  core = read_csv("core_app.csv"),
+  ring = read_csv("ring_app.csv")
+)
+
+data_all <- read_csv("data_all_app.csv")
+
+```
+
+# Calculate the growth change and releases at the tree level
+
+```{r growth change, echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+data.growth <- growthCalculate(data = data_list, windowLength = 10)
+
+data.release <- releaseCalculate(data = data.growth, gapAge = c(5:15), nprol = 7)
+```
+
+# Calculate the Kernel density and find peaks at the plot level
+
+## Disturbance history data
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+data_all %>% 
+  rowwise() %>%
+  mutate(ca = eval(parse(text = dbh_ca_f))) %>% 
+  ungroup() %>%
+  do({
+    x <- .
+    inner_join(
+      x %>% group_by(plotid, species, event, year) %>% summarise(ca = sum(ca)),
+      x %>% distinct(tree_id, .keep_all = T) %>% group_by(plotid) %>% summarise(ca_f = sum(ca), n = n()) %>% filter(n >= 5),
+      by = 'plotid'
+    ) 
+  }) %>%
+  ungroup() %>%
+  mutate(ca = ca * 100 / ca_f) %>%
+  arrange(plotid, year) %>%
+  filter(year %in% c(1600:2010)) %>%
+  select(plotid, species, event, year, ca) %>%
+  gather(plot_type, value, -year, -ca, -plotid) %>%
+  mutate(plot_type = factor(plot_type, levels = c('species', 'event')),
+         Species = factor(value, levels = c('Picea', 'Fagus', 'Abies', 'Acer', 'Pinus', 'Others', 'gap', 'release', 'no event')))->
+  data.dist
+
+```
+
+## Calculate the Kernel density (MDS) and the moving sums
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+data.dist %>%
+  filter(plot_type == 'species') %>%
+  group_by(plotid, year) %>%
+  summarise(ca = sum(ca)) %>%
+  group_by(plotid) %>%
+  complete(year = 1600:2030, fill = list(ca = 0)) %>%
+  mutate(value = mdsFun(ca, k = 30, bw = 5, st = 7),
+         ca = round(ca, digits = 2),
+         severity = rollapply(ca, width = 11, FUN = sum, fill = 0)) %>%
+  ungroup() %>%
+  filter(year %in% c(1600:2010)) ->
+  data.mds
+
+```
+
+## Detect the peaks in Kernel density
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+data.mds %>%
+  group_by(plotid) %>%
+  filter(row_number() %in% peakDetection(x = value, threshold = 10, nups = 5,  mindist = 10)) %>% 
+  mutate(method = '10_10_5') %>%
+  ungroup() ->
+  data.peaks
+
+```
+
+# Calculate the Kernel density and find peaks at the stand level
+
+## Data
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+data.peaks %>% 
+  filter(severity > 10) %>%
+  mutate(value = round(value, digits = 5)) %>%
+  inner_join(., plots_clean, by = "plotid") %>%
+  select(plotid, Xjtsk, Yjtsk, country, newstand, year, ca_per = ca, kde = value, severity) ->
+  dist_eventsb
+
+```
+
+## Calculate and bootstrap density function for chronologies of plot level events
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+dist_eventsb %>% 
+  select(country, newstand, plotid, year) %>%
+  filter(!is.na(newstand)) %>%
+  group_by(country, newstand) %>% 
+  mutate(nplots = length(unique(plotid))) %>%
+  filter(year %in% c(1811:1989)) %>% 
+  slice(rep(1:n(), each = 1000)) %>%
+  ungroup() %>% 
+  mutate(rep = rep(1:1000, times = nrow(.) / 1000)) ->
+  standlevel_densityf_boot
+
+standlevel_densityf_boot %>%
+  distinct(., country, newstand, plotid, rep) %>% 
+  group_by(country, newstand, rep) %>%
+  sample_n(., size = 10, replace = TRUE) %>%
+  left_join(., standlevel_densityf_boot, by = c("country", "newstand", "plotid", "rep")) %>%
+  group_by(country, newstand, year, rep) %>%
+  summarise(nevents = n(),
+            nplots = mean(nplots),
+            freq = nevents / nplots) %>%
+  group_by(country, newstand, rep) %>%
+  complete(year = c(1780:2020), fill = list(freq = 0)) %>%
+  mutate(density_pre = mdsFun(freq, k = 30, bw = 5, st = 7),
+         density = rollapply(density_pre, width = 5, FUN = mean, fill = 0)) %>% 
+  ungroup() ->
+  standlevel_densityf_boot
+
+```
+
+## Find peaks in all (bootstrapped) density functions and select most frequent peaks
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+standlevel_densityf_boot %>%
+  filter(dplyr::row_number() %in% peakDetection(x = density, threshold = 0.00001, nups = 5,  mindist = 10),
+         year %in% c(1812:1988)) %>%
+  group_by(country, newstand, year) %>%
+  summarise(freq = n()/100) %>%
+  group_by(country, newstand) %>%
+  complete(year = c(1780:2020), fill = list(freq = 0)) %>%
+  mutate(freqsmooth = mdsFun(freq, k = 11, bw = 1, st = 7)/10) %>%
+  filter(row_number() %in% peakDetection(x = freqsmooth, threshold = 0.00001, nups = 0,  mindist = 10)) %>%
+  unite(peakid, c("country", "newstand", "year"), sep = "-", remove = FALSE) %>%
+  select(peakid, country, newstand, year, freqsmooth) %>%
+  ungroup() -> 
+  standlevel_peaks
+```
+
+## Group plot level events (join plot level events with closest stand level peaks)
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+dist_events_dt <- data.table::data.table(subset(subset(dist_eventsb, !is.na(newstand)), year %in% c(1811:1989)),
+  key = c("country", "newstand", "year"))
+
+standlevel_peaks_dt <- data.table::data.table(standlevel_peaks, key = c("country", "newstand", "year"))
+
+dist_eventsb %>%
+  left_join(.,
+    data.frame(standlevel_peaks_dt[dist_events_dt,
+      list(country, newstand, year, peakid, plotid),
+      roll = "nearest"]) %>%
+      mutate(peakyear = as.numeric(substr(peakid, nchar(peakid) - 3, nchar(peakid)))) %>% 
+      select(plotid, year, peakid, peakyear), 
+    by = c("plotid", "year")) %>%
+  select(plotid, X = Xjtsk, Y = Yjtsk, country, newstand, year, ca_per, kde, peakid, peakyear, severity) ->
+  standlevel_dist_events_joined
+```
+
+# Calculate the disturbance characteristics and their rotation periods
+
+## Stand proportion disturbed
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+standlevel_dist_events_joined %>% 
+  filter(!is.na(peakyear)) %>%
+  group_by(newstand, peakyear) %>%
+  summarize(nplots_disturb = n()) %>%
+  left_join(.,
+            plots_clean %>% 
+              filter(!is.na(newstand)) %>%
+              group_by(locality, country, landscape, newstand) %>%
+              summarize(nplots = n()),
+            by = "newstand") %>%
+  mutate(plotsprop_disturb = nplots_disturb/nplots) ->
+  plotsprop_disturb
+```
+
+## Rotation period of disturbance severity
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+standlevel_dist_events_joined %>% 
+  group_by(country, newstand, plotid) %>% 
+  summarize(nevents = n()) %>%
+  slice(rep(1:n(), each = 1000)) %>%
+  ungroup() %>% 
+  mutate(rep = rep(1:1000, times = nrow(.) / 1000)) %>%
+  group_by(rep) %>%
+  sample_n(., size = 50, replace = TRUE) %>%
+  left_join(., standlevel_dist_events_joined, by = c("country", "newstand", "plotid")) %>%
+  mutate(severityclass = floor(severity/5) * 5) %>%
+  group_by(plotid, rep) %>% 
+  mutate(ch_length = 1990 - min(year)) ->
+  rotation_severity_boot
+
+rotation_severity_boot %>% 
+  group_by(rep, plotid) %>% 
+  summarize(ch_length = mean(ch_length)) %>%
+  group_by(rep) %>% 
+  summarize(rep_length = sum(ch_length)) ->
+  rep_length
+
+rotation_severity_boot %>% 
+  group_by(rep, severityclass) %>%
+  summarize(distevents_n = n()) %>%
+  group_by(rep) %>%
+  complete(severityclass = seq(10, 150, 5), fill = list(distevents_n = 0)) %>%
+  left_join(., rep_length, by = "rep") %>%
+  arrange(rep, desc(severityclass)) %>%
+  group_by(rep) %>%
+  mutate(rotation_s = rep_length/cumsum(distevents_n)) %>%
+  group_by(severityclass) %>% 
+  summarize(conf95 = quantile(rotation_s, probs = 0.975), 
+            conf05 = quantile(rotation_s, probs = 0.025)) %>%
+  filter(severityclass < 100) ->
+  rotation_severity_confidence
+
+standlevel_dist_events_joined %>%
+  left_join(., plots_clean, by = "plotid") %>%
+  group_by(landscape, plotid) %>% 
+  summarize(ch_length = 1990 - min(year)) %>%
+  group_by(landscape) %>% 
+  summarize(length = sum(ch_length)) ->
+  length_landscapes
+
+standlevel_dist_events_joined %>% 
+  select(plotid, year, severity) %>% 
+  mutate(severityclass = floor(severity/5) * 5) %>%
+  left_join(., plots_clean, by = "plotid") %>%
+  group_by(landscape, severityclass) %>%
+  summarize(distevents_n = n()) %>%
+  arrange(landscape, desc(severityclass)) %>%
+  left_join(., length_landscapes, by = "landscape") %>%
+  mutate(rotation_s = length/cumsum(distevents_n)) %>%
+  select(-distevents_n) %>% 
+  filter(severityclass < 100) %>%
+  ungroup()->
+  rotation_severity_landscapes
+
+length <- sum((standlevel_dist_events_joined %>% group_by(plotid) %>% summarize(ch_length = 1990 - min(year)))$ch_length)
+
+standlevel_dist_events_joined %>% 
+  select(plotid, year, severity) %>% 
+  mutate(severityclass = floor(severity/5) * 5) %>%
+  group_by(severityclass) %>% 
+  summarize(distevents_n = n()) %>%
+  arrange(desc(severityclass))%>%
+  mutate(rotation_s = length/cumsum(distevents_n)) %>%
+  select(-distevents_n) ->
+  rotation_severity
+```
+
+## Rotation period of disturbance patch size
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+dist_patches %>% 
+  group_by(newstand) %>% 
+  summarize(nevents = n()) %>%
+  slice(rep(1:n(), each = 1000)) %>%
+  ungroup() %>% 
+  mutate(rep = rep(1:1000, times = nrow(.) / 1000)) ->
+  rotation_patchsize_boot
+
+rotation_patchsize_boot %>%
+  group_by(rep) %>%
+  sample_n(., size = 20, replace = TRUE) %>%
+  left_join(., dist_patches, by = "newstand") %>%
+  mutate(patchsizeclass = floor(patch_area/5) * 5) %>%
+  group_by(newstand, rep) %>% 
+  mutate(ch_length = 1990 - min(peakyear)) ->
+  rotation_patchsize_boot
+
+rotation_patchsize_boot %>% 
+  group_by(rep, newstand) %>% 
+  summarize(ch_length = mean(ch_length)) %>%
+  group_by(rep) %>% 
+  summarize(rep_length = sum(ch_length)) ->
+  rep_length
+
+rotation_patchsize_boot %>% 
+  group_by(rep, patchsizeclass) %>%
+  summarize(distevents_n = n()) %>%
+  group_by(rep) %>%
+  complete(patchsizeclass = seq(0, 60, 5), fill = list(distevents_n = 0)) %>%
+  left_join(., rep_length, by = "rep") %>%
+  arrange(rep, desc(patchsizeclass)) %>%
+  group_by(rep) %>%
+  mutate(rotation_s = rep_length/cumsum(distevents_n)) %>%
+  group_by(patchsizeclass) %>% 
+  summarize(conf95 = quantile(rotation_s, probs = 0.975),
+            conf05 = quantile(rotation_s, probs = 0.025)) ->
+  rotation_patchsize_confidence
+
+dist_patches %>%
+  left_join(., 
+            plots_clean %>% 
+              filter(!is.na(newstand)) %>%
+              group_by(locality, country, landscape, newstand) %>%
+              summarize(nplots = n()),
+            by = "newstand") %>%
+  group_by(landscape, newstand) %>% 
+  summarize(ch_length = 1990 - min(peakyear)) %>%
+  group_by(landscape) %>% 
+  summarize(lengthp = sum(ch_length))->
+  length_patch_landscapes
+
+dist_patches %>% 
+  select(newstand, peakyear, patch_area) %>% 
+  mutate(patchsizeclass = floor(patch_area/5) * 5) %>%
+  left_join(., 
+            plots_clean %>% 
+              filter(!is.na(newstand)) %>%
+              group_by(locality, country, landscape, newstand) %>%
+              summarize(nplots = n()), 
+            by = "newstand") %>%
+  group_by(landscape, patchsizeclass) %>%
+  summarize(distevents_n = n()) %>%
+  complete(patchsizeclass = seq(0, 60, 5), fill = list(distevents_n = 0)) %>%
+  arrange(landscape, desc(patchsizeclass)) %>%
+  left_join(., length_patch_landscapes, by = "landscape") %>%
+  mutate(rotation_patch = lengthp/cumsum(distevents_n)) %>%
+  select(-distevents_n) %>%
+  ungroup()->
+  rotation_patchsize_landscapes
+
+length_patch <- sum((dist_patches %>% group_by(newstand) %>% summarize(ch_length = 1990 - min(peakyear)))$ch_length)
+
+dist_patches %>% 
+  select(newstand, peakyear, patch_area) %>% 
+  mutate(patchsizeclass = floor(patch_area/5) * 5) %>%
+  group_by(patchsizeclass) %>% 
+  summarize(distevents_n = n()) %>%
+  arrange(desc(patchsizeclass))%>%
+  mutate(rotation_s = length_patch/cumsum(distevents_n)) %>%
+  select(-distevents_n) ->
+  rotation_patchsize
+```
+
+## Rotation period of stand proportion disturbed
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+plotsprop_disturb %>% 
+  group_by(newstand) %>% 
+  summarize(nevents = n()) %>%
+  slice(rep(1:n(), each = 1000)) %>%
+  ungroup() %>% 
+  mutate(rep = rep(1:1000, times = nrow(.) / 1000)) ->
+  rotation_prop_boot
+
+rotation_prop_boot %>%
+  group_by(rep) %>%
+  sample_n(., size = 20, replace = TRUE) %>%
+  left_join(., plotsprop_disturb, by = "newstand") %>%
+  mutate(proportionclass = floor(100 * plotsprop_disturb/5) * 5) %>%
+  group_by(newstand, rep) %>% 
+  mutate(ch_length = 1990 - min(peakyear)) ->
+  rotation_prop_boot
+
+rotation_prop_boot %>% 
+  group_by(rep, newstand) %>% 
+  summarize(ch_length = mean(ch_length)) %>%
+  group_by(rep) %>% 
+  summarize(rep_length = sum(ch_length)) ->
+  rep_length
+
+rotation_prop_boot %>% 
+  group_by(rep, proportionclass) %>%
+  summarize(distevents_n = n()) %>%
+  group_by(rep) %>%
+  complete(proportionclass = seq(0, 125, 5), fill = list(distevents_n = 0)) %>%
+  left_join(., rep_length, by = "rep") %>%
+  arrange(rep, desc(proportionclass)) %>%
+  group_by(rep) %>%
+  mutate(rotation_s = rep_length/cumsum(distevents_n)) %>%
+  group_by(proportionclass) %>% 
+  summarize(conf95 = quantile(rotation_s, probs = 0.975),
+            conf05 = quantile(rotation_s, probs = 0.025)) ->
+  rotation_prop_confidence
+
+plotsprop_disturb %>%
+  group_by(landscape, newstand) %>% 
+  summarize(ch_length = 1990 - min(peakyear)) %>%
+  group_by(landscape) %>% 
+  summarize(lengthpr = sum(ch_length))->
+  length_prop_landscapes
+
+plotsprop_disturb %>% 
+  select(newstand, landscape, peakyear, plotsprop_disturb) %>%
+  mutate(proportionclass = floor(100 * plotsprop_disturb/5) * 5) %>%
+  group_by(landscape, proportionclass) %>% 
+  summarize(distevents_n = n()) %>%
+  complete(proportionclass = seq(0, 125, 5), fill = list(distevents_n = 0)) %>%
+  arrange(landscape, desc(proportionclass))%>%
+  left_join(., length_prop_landscapes, by = "landscape") %>%
+  mutate(rotation_prop = lengthpr/cumsum(distevents_n)) %>%
+  select(-distevents_n) %>% 
+  filter(proportionclass < 105) %>%
+  ungroup()->
+  rotation_prop_landscapes
+
+length_prop <- sum((plotsprop_disturb %>% group_by(newstand) %>% summarize(ch_length = 1990 - min(peakyear)))$ch_length)
+
+plotsprop_disturb %>% 
+  select(newstand, peakyear, plotsprop_disturb) %>%
+  mutate(proportionclass = floor(100 * plotsprop_disturb/5) * 5) %>%
+  group_by(proportionclass) %>% 
+  summarize(distevents_n = n()) %>%
+  arrange(desc(proportionclass))%>%
+  mutate(rotation_s=length_prop/cumsum(distevents_n)) %>%
+  select(-distevents_n) ->
+  rotation_prop
+```
